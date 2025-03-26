@@ -17,6 +17,7 @@ from fastapi import Request
 from services.chatbot_service import chatbot_service
 import os
 from dotenv import load_dotenv
+from contextlib import asynccontextmanager
 
 # Load environment variables
 load_dotenv()
@@ -28,10 +29,33 @@ logger = logging.getLogger(__name__)
 # Get the current directory
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifespan event handler for FastAPI"""
+    try:
+        # Create necessary directories
+        os.makedirs("data/datasets", exist_ok=True)
+        os.makedirs("data/processed", exist_ok=True)
+        
+        # Load data
+        data_service.load_data()
+        
+        print("✅ Application initialized successfully")
+        print("📊 Data service loaded")
+        print("🤖 Chatbot service ready")
+        print("🔍 GenAI service initialized")
+        
+        yield
+        
+    except Exception as e:
+        print(f"❌ Error during startup: {str(e)}")
+        raise
+
 app = FastAPI(
     title="Banking Dashboard API",
     description="API for the Banking Dashboard with AI-powered features",
-    version="1.0.0"
+    version="1.0.0",
+    lifespan=lifespan
 )
 
 # Configure CORS
@@ -221,24 +245,88 @@ async def read_root(request: Request):
     return templates.TemplateResponse("chat.html", {"request": request})
 
 @app.post("/api/v1/chat")
-async def chat(chat_message: ChatMessage):
+async def chat(message: dict):
     """Handle chat messages"""
     try:
-        response = await chatbot_service.process_message(chat_message.message, chat_message.customer_id)
+        response = await chatbot_service.process_message(message["message"])
         return response
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/v1/customer/{customer_id}/analysis")
-async def analyze_customer(customer_id: str):
-    """Get comprehensive analysis for a customer"""
+async def get_customer_analysis(customer_id: str):
+    """Get detailed analysis for a customer"""
     try:
-        analysis = await genai_service.get_customer_insights(customer_id)
-        if not analysis:
-            raise HTTPException(status_code=404, detail="Customer not found")
-        return analysis
+        # Get customer profile
+        profile = data_service.get_customer_profile(customer_id)
+        if not profile:
+            return {
+                "error": "Customer not found",
+                "customer_id": customer_id
+            }
+
+        # Get transaction data
+        transactions = data_service.get_user_transactions(customer_id)
+        if transactions.empty:
+            return {
+                "error": "No transaction data available",
+                "customer_id": customer_id
+            }
+
+        # Calculate transaction metrics
+        total_spent = transactions['amount'].sum()
+        avg_transaction = transactions['amount'].mean()
+        category_breakdown = transactions.groupby('category')['amount'].sum().to_dict()
+        recent_transactions = transactions.nlargest(5, 'date')[
+            ['category', 'amount', 'date']
+        ].to_dict('records')
+
+        # Get sentiment data
+        sentiment_data = data_service.get_customer_recommendations(customer_id)
+        sentiment_metrics = sentiment_data.get('sentiment_metrics', {}) if sentiment_data else {}
+
+        return {
+            "customer_id": customer_id,
+            "profile": profile,
+            "transaction_metrics": {
+                "total_spent": total_spent,
+                "avg_transaction": avg_transaction,
+                "category_breakdown": category_breakdown,
+                "recent_transactions": recent_transactions
+            },
+            "sentiment_metrics": sentiment_metrics
+        }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        return {
+            "error": str(e),
+            "customer_id": customer_id
+        }
+
+@app.get("/api/v1/customer/{customer_id}/insights")
+async def get_customer_insights(customer_id: str):
+    """Get AI-powered insights for a customer"""
+    try:
+        # Validate customer exists
+        profile = data_service.get_customer_profile(customer_id)
+        if not profile:
+            return {
+                "error": "Customer not found",
+                "customer_id": customer_id
+            }
+
+        # Get AI insights
+        insights = await genai_service.get_customer_insights(customer_id)
+        
+        return {
+            "customer_id": customer_id,
+            "insights": insights,
+            "timestamp": datetime.now().isoformat()
+        }
+    except Exception as e:
+        return {
+            "error": str(e),
+            "customer_id": customer_id
+        }
 
 @app.get("/api/v1/customer/{customer_id}/recommendations")
 async def get_recommendations(customer_id: str):
@@ -274,18 +362,6 @@ async def load_data(file: UploadFile = File(...)):
         logger.error(f"Error loading data: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/api/v1/customer/{customer_id}/insights")
-async def get_customer_insights(customer_id: str):
-    """Get AI-powered insights for a specific customer"""
-    try:
-        insights = await genai_service.get_customer_insights(customer_id)
-        if "error" in insights:
-            raise HTTPException(status_code=404, detail=insights["error"])
-        return insights
-    except Exception as e:
-        logger.error(f"Error getting customer insights: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
 @app.get("/api/v1/customer/{customer_id}/profile")
 async def get_customer_profile(customer_id: str):
     """Get complete customer profile"""
@@ -318,7 +394,7 @@ def main():
         
         # Initialize data service
         print("Initializing data service...")
-        data_service.initialize()
+        data_service.load_data()
         
         # Start the server
         print("\nStarting Customer Analytics Chatbot...")

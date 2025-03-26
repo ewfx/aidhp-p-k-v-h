@@ -1,4 +1,4 @@
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any
 import openai
 from transformers import pipeline
 import os
@@ -7,6 +7,7 @@ import pandas as pd
 from datetime import datetime, timedelta
 import random
 from .data_service import data_service
+import numpy as np
 
 load_dotenv()
 
@@ -28,36 +29,133 @@ class GenAIService:
             self.sentiment_analyzer = None
             self.zero_shot_classifier = None
 
-    async def get_customer_insights(self, customer_id: str) -> Dict:
-        """Get AI-powered insights for a specific customer"""
+    async def get_customer_insights(self, customer_id: str) -> Dict[str, Any]:
+        """Get AI-powered insights for a customer"""
         try:
-            # Get customer data from data service
-            customer_data = data_service.get_customer_profile(customer_id)
-            if not customer_data:
-                raise ValueError(f"No data found for customer {customer_id}")
+            # Get customer profile
+            profile = data_service.get_customer_profile(customer_id)
+            if not profile:
+                return {
+                    "error": "Customer not found",
+                    "customer_id": customer_id
+                }
 
-            # Get recommendations
-            recommendations = data_service.get_customer_recommendations(customer_id)
+            # Get transaction data
+            transactions = data_service.get_user_transactions(customer_id)
+            if transactions.empty:
+                return {
+                    "error": "No transaction data available",
+                    "customer_id": customer_id
+                }
 
-            # Generate insights using OpenAI
-            if self.openai_api_key:
-                insights = await self._generate_ai_insights(customer_data, recommendations)
-            else:
-                insights = self._generate_basic_insights(customer_data, recommendations)
+            # Calculate transaction metrics
+            total_spent = transactions['amount'].sum()
+            avg_transaction = transactions['amount'].mean()
+            category_breakdown = transactions.groupby('category')['amount'].sum().to_dict()
+            recent_transactions = transactions.nlargest(5, 'date')[
+                ['category', 'amount', 'date']
+            ].to_dict('records')
 
-            return {
-                'customer_id': customer_id,
-                'insights': insights,
-                'recommendations': recommendations,
-                'data_summary': customer_data
+            # Get sentiment data
+            sentiment_data = data_service.get_customer_recommendations(customer_id)
+            sentiment_metrics = sentiment_data.get('sentiment_metrics', {}) if sentiment_data else {}
+
+            # Generate insights based on the data
+            insights = {
+                "profile_insights": {
+                    "age_group": self._get_age_group(profile.get('age')),
+                    "income_level": self._get_income_level(profile.get('income')),
+                    "occupation_insights": self._get_occupation_insights(profile.get('occupation'))
+                },
+                "spending_insights": {
+                    "total_spent": total_spent,
+                    "avg_transaction": avg_transaction,
+                    "top_categories": sorted(category_breakdown.items(), key=lambda x: x[1], reverse=True)[:3],
+                    "spending_trend": self._analyze_spending_trend(transactions)
+                },
+                "sentiment_insights": {
+                    "overall_sentiment": sentiment_metrics.get('avg_sentiment_score', 0),
+                    "platform_breakdown": sentiment_metrics.get('sentiment_by_platform', {})
+                }
             }
+
+            return insights
 
         except Exception as e:
-            print(f"Error getting customer insights: {str(e)}")
+            print(f"Error generating customer insights: {str(e)}")
             return {
-                'error': str(e),
-                'customer_id': customer_id
+                "error": str(e),
+                "customer_id": customer_id
             }
+
+    def _get_age_group(self, age: Optional[int]) -> str:
+        """Categorize age into groups"""
+        if not age:
+            return "Unknown"
+        if age < 25:
+            return "Young Professional"
+        elif age < 35:
+            return "Early Career"
+        elif age < 45:
+            return "Mid Career"
+        elif age < 55:
+            return "Established Professional"
+        else:
+            return "Senior Professional"
+
+    def _get_income_level(self, income: Optional[float]) -> str:
+        """Categorize income into levels"""
+        if not income:
+            return "Unknown"
+        if income < 50000:
+            return "Entry Level"
+        elif income < 100000:
+            return "Mid Level"
+        elif income < 150000:
+            return "Upper Mid Level"
+        else:
+            return "High Level"
+
+    def _get_occupation_insights(self, occupation: Optional[str]) -> Dict[str, Any]:
+        """Generate insights based on occupation"""
+        if not occupation:
+            return {"category": "Unknown", "risk_level": "Unknown"}
+        
+        occupation = occupation.lower()
+        if any(tech in occupation for tech in ['engineer', 'developer', 'programmer', 'software']):
+            return {"category": "Technology", "risk_level": "Moderate"}
+        elif any(finance in occupation for finance in ['banker', 'finance', 'accountant', 'analyst']):
+            return {"category": "Finance", "risk_level": "Conservative"}
+        elif any(health in occupation for health in ['doctor', 'nurse', 'healthcare', 'medical']):
+            return {"category": "Healthcare", "risk_level": "Conservative"}
+        elif any(edu in occupation for edu in ['teacher', 'professor', 'educator', 'academic']):
+            return {"category": "Education", "risk_level": "Conservative"}
+        else:
+            return {"category": "Other", "risk_level": "Moderate"}
+
+    def _analyze_spending_trend(self, transactions: pd.DataFrame) -> str:
+        """Analyze spending trend over time"""
+        if transactions.empty:
+            return "No transaction data available"
+            
+        # Group by date and calculate daily spending
+        daily_spending = transactions.groupby('date')['amount'].sum()
+        
+        # Calculate trend
+        if len(daily_spending) < 2:
+            return "Insufficient data for trend analysis"
+            
+        # Calculate simple linear regression
+        x = np.arange(len(daily_spending))
+        y = daily_spending.values
+        slope = np.polyfit(x, y, 1)[0]
+        
+        if slope > 0:
+            return "Increasing spending trend"
+        elif slope < 0:
+            return "Decreasing spending trend"
+        else:
+            return "Stable spending pattern"
 
     async def _generate_ai_insights(self, customer_data: Dict, recommendations: Dict) -> Dict:
         """Generate detailed insights using OpenAI"""
